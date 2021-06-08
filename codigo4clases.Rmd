@@ -1,0 +1,2087 @@
+---
+title: "codigo4clases"
+author: "Amelia Martínez Sequera"
+date: "8/6/2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_knit$set(root.dir = "~/UOC/TFM/TFM5", comment = NULL, message=FALSE, warning=FALSE,cache = TRUE)
+
+```
+## 2. Librerías
+
+```{r global_options, echo=FALSE}
+knitr::opts_chunk$set(fig.path="Figs2/", message=FALSE, warning=FALSE, fig.width=11)
+
+library(timevis)
+library(kableExtra)
+library(ggplot2)
+library(factoextra)
+library(cluster)
+library(FactoMineR)
+library(clValid)
+library(bindrcpp)
+library(optCluster)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+library(GEOquery)
+library(rlang)
+library(limma)
+library(edgeR)
+library(preprocessCore)
+library(affy)
+library(Biobase)
+library(multiClust)
+library(dplyr)
+library(genefilter)
+library(tidyr)
+library(hgu133plus2.db)
+library(ggplot2)
+library(hexbin)
+library(RColorBrewer)
+library(beadarray)
+library(illuminaHumanv3.db)
+library(convert)
+library(IRanges)
+library(DESeq2)
+library(purrr)
+library(caret)
+
+```
+
+## 3. Datos
+```{r}
+gse<- "GSE136411"
+gse_exprs <- getGEO(GEO=gse,  GSEMatrix=TRUE)
+
+A<-Biobase::pData(gse_exprs$`GSE136411-GPL10558_series_matrix.txt.gz`) %>% as_tibble()
+
+A<- dplyr::select(A, title, geo_accession, characteristics_ch1,description)
+
+B<-Biobase::pData(gse_exprs$`GSE136411-GPL6104_series_matrix.txt.gz`) %>% as_tibble()
+
+B<- dplyr::select(B, title, geo_accession, characteristics_ch1,description)
+
+(Sampleinf<- rbind(B,A))
+```
+
+```{r}
+getGEOSuppFiles(gse, makeDirectory=T, baseDir="geo_downloads")
+
+GEOquery::gunzip("geo_downloads/GSE136411/GSE136411_Matrix-merged-normalized-batch.corrected.txt.gz",overwrite = TRUE, remove = FALSE)
+
+GEOquery::gunzip("geo_downloads/GSE136411/GSE136411_Matrix-merged-non-normalized-raw.txt.gz",overwrite = TRUE, remove = FALSE)
+
+```
+
+### 3.1. Reestructuración de los datos
+
+Se realizan una serie de modificaciones para almacenar la información en un dataframe en el que cada fila representa una muestra y las columnas contienen la información relativa a ellas (información descriptiva sobre el tipo de EM y la expresión de los genes).
+
+```{r}
+
+datos_raw <- readr::read_delim("geo_downloads/GSE136411/GSE136411_Matrix-merged-normalized-batch.corrected.txt", delim = "\t", col_names = TRUE,
+                    progress = FALSE)
+
+descripcion_genes <- datos_raw[,1]
+
+datos<- data.frame(datos_raw[,-1], row.names= datos_raw$`ID_REF `)
+
+datos<- t(datos)
+
+datos<- cbind(rownames(datos), data.frame(datos, row.names = NULL))
+names(datos)[1] = "description"
+
+datos <- dplyr::full_join(Sampleinf, datos, by="description")
+
+library(stringr)
+
+datos$title %>% as.factor() %>% str_replace_all('.*(PBMC_CIS_).*','CIS') %>% str_replace_all('.*(PBMC_RR_).*','RR')%>% str_replace_all('.*(PBMC_PP_).*','PP')%>% str_replace_all('.*(PBMC_SP_).*','SP')%>% str_replace_all('.*(PBMC_HC_).*','HC')%>% str_replace_all('.*(PBMC_OND_).*','OND') -> datos$type
+
+datos$characteristics_ch1 %>% as.factor()%>%
+  str_replace_all('.*(disease: multiple sclerosis).*','MS')%>%
+  str_replace_all('.*(disease: other neurological disease).*','Other')%>%
+  str_replace_all('.*(disease: none).*','health') -> datos$grupo
+
+info_muestras <-datos%>% dplyr::select(description, geo_accession, title, type, grupo)
+
+datos<-datos%>% dplyr::select(-description, -title, -geo_accession, -characteristics_ch1, -type, -grupo)
+
+datos<- log2(datos)
+
+datos2<- cbind(info_muestras$description, datos)
+names(datos2)[1] <- "muestra"
+```
+### 3.2. Filtrado de calidad de datos.
+
+La tecnología microarray empleada para cuantificar los niveles de expresión tiene unos límites de detección, fuera de los cuales, la lectura no es fiable.
+
+Si la señal es inferior a 10 unidades, se considera ruido y debe interpretarse como que no hay expresión de ese gen. En el extremo opuesto, 34 unidades es el valor máximo.
+
+Prácticamente ninguno de los valores de este dataset se corresponden a lecturas por debajo del límite de detección (ruido), porque ya viene corregido.
+
+Es importante remarcar que esta trasformación es un paso de limpieza, no un preprocesado de datos para mejorar el modelo, por lo tanto, sí puede hacerse sobre todas las observaciones antes de separarlas en conjunto de entrenamiento y test.
+
+```{r}
+
+datos_long <- datos2 %>% gather(key= "gen",  value= "expresion", -muestra) %>%
+  mutate(fuera_rango = if_else(expresion< 10| expresion> 34,
+                               "SI", "NO"))
+# Proporción de valores por debajo del mínimo de detección
+nrow(datos_long %>% filter(expresion < 10)) / nrow(datos_long)
+
+# Proporción de valores por encima del máximo de detección
+nrow(datos_long %>% filter(expresion > 34)) / nrow(datos_long)
+
+# Proporción de valores fuera de rango de detección
+nrow(datos_long %>% filter(fuera_rango == "SI")) / nrow(datos_long)
+
+# Representación gráfica de los valores fuera de rango de detección
+ggplot(data = datos_long, aes(x = gen, y = muestra, fill = fuera_rango)) +
+  geom_raster() +
+  scale_fill_manual(values = c("gray50", "orangered2")) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text = element_blank(),
+        axis.ticks = element_blank())
+```
+
+### 3.4. Exploración de los datos.
+
+### 3.4.1. Cantidad y tipo de muestras.
+
+El set de datos se dispone de 336 muestras, agrupadas en 3 grupos, que a su vez se subdividen en tipos: sanos (HC), con EM (CIS,RR, PP, SP) y con otras enfermedades neurológicas (OND).
+
+```{r}
+info_muestras %>%
+  dplyr::group_by(grupo) %>%
+  dplyr::count()
+```
+```{r}
+info_muestras %>%
+  dplyr::filter(grupo == "MS") %>%
+  dplyr::group_by(type) %>%
+  dplyr::count()
+```
+
+
+```{r}
+info_muestras %>%
+  dplyr::group_by(type) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = reorder(type, n), y = n)) +
+    geom_col(fill = "gray60", color = "black") +
+    coord_flip() +
+    theme_bw() +
+    labs(x = "Tipos de muestra", y = "Número de muestras",
+         title = "Número de muestras por tipo") +
+    theme(legend.position = "bottom")
+```
+
+
+```{r}
+info_muestras %>%
+  dplyr::group_by(type) %>%
+  dplyr::count() %>%
+  ggplot(aes(x = type, y = n, fill = type)) +
+    geom_col() +
+    scale_fill_manual(values = c("red","gray50", "green", "red", "red", "red")) +
+    theme_bw() +
+    labs(x = "Tipo de muestra", y = "Número de muestras",
+         title = "Número de muestras por tipos de EM") +
+    theme(legend.position = "none")
+```
+
+
+
+### 3.4.2. Valores ausentes.
+
+```{r}
+na_por_columna <- map_dbl(.x = datos, .f = function(x){sum(is.na(x))})
+any(na_por_columna > 0)
+
+```
+Se comprueba que para todas las muestras se dispone del valor de expresión .El set de datos está completo, no hay valores ausentes.
+
+## 4. División y preprocesado de los datos.
+
+### 4.1. División de los datos.
+
+
+```{r, message=FALSE}
+datost <- cbind(info_muestras$type, datos)
+names(datost)[1] <- "type"
+
+datost <- datost %>% dplyr::filter(type== c("CIS", "PP","SP","RR"))
+
+# Se crean los índices de las observaciones de entrenamiento (80%)
+set.seed(123)
+train <- createDataPartition(y = datost$type, p = 0.8, list = FALSE, times = 1)
+datos_train <- datost[train, ]
+datos_test  <- datost[-train, ]
+```
+Es importante verificar que la distribución de la variable respuesta es similar en el conjunto de entrenamiento y en el de test. Por defecto, la función createDataPartition() garantiza una distribución aproximada (reparto estratificado).
+
+```{r}
+distribucion_train <- prop.table(table(datos_train$type)) %>% round(3)
+distribucion_test  <- prop.table(table(datos_test$type)) %>% round(3)
+data.frame(train = distribucion_train, test = distribucion_test )
+```
+
+
+
+Aciertos si se emplea la clase mayoritaria como predictor:
+
+```{r}
+# Aciertos si se emplea la clase mayoritaria como predictor
+mean(datos_train$type == "RR")
+```
+### 4.2. Preprocesado.
+
+
+### 4.2.1. Genes con varianza próxima a cero.
+
+
+```{r, echo=TRUE}
+sum(datos_train%>% nearZeroVar(saveMetrics = TRUE) == FALSE)
+```
+
+### 4.2.2. Estandarización.
+
+
+```{r}
+estandarizador <- preProcess(x = datos_train, method = c("center", "scale"))
+datos_train    <- predict(object = estandarizador, newdata = datos_train)
+datos_test     <- predict(object = estandarizador, newdata = datos_test)
+
+```
+
+## 5. Selección de genes y reducción de dimensionalidad:
+- Anova p-value
+- Signal to noise (S2N)
+- Comparación de filtrados
+- Reducción de dimensionalidad 
+
+### 5.1. Anova p-value
+
+
+
+```{r}
+# Representación de la expresión de 100 genes seleccionados de forma aleatoria.
+set.seed(123)
+datos_train %>% select_at(sample(4:ncol(datos_train), 100)) %>%
+  gather(key = "gen", value = "expresion") %>%
+  ggplot(aes(x = gen , y = expresion)) +
+    geom_boxplot(outlier.size = 0.3, fill = "gray70") +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())
+```
+
+
+Se aplica un análisis ANOVA para cada uno de los genes.
+
+```{r}
+custom_anova <- function(x,y){
+  anova <- summary(aov(x ~ as.factor(y)))
+  return(unlist(anova)["Pr(>F)1"])
+}
+
+p_values <- datos_train %>%
+            dplyr:: select(-type) %>%
+            map_dbl(.f = custom_anova, y = datos_train$type) %>%
+            sort() 
+p_values %>% head(10)
+```
+
+.
+
+### VERSIÓN NO PARALELIZADA 
+
+
+```{r}
+
+# Se emplea un número de resampling bajo para que no tarde demasiado. Para valores más elevados emplear la versión paralelizada que se describe más adelante.
+
+n_boot <- 3
+resultados_anova <- vector(mode = "list", length = n_boot)
+
+# Semillas para que los muestreos sean reproducibles
+set.seed(123)
+seeds = sample.int(1000, size = n_boot)
+
+# Función ANOVA
+custom_anova <- function(x,y){
+  anova <- summary(aov(x ~ as.factor(y)))
+  return(unlist(anova)["Pr(>F)1"])
+}
+
+for (i in 1:n_boot){
+  # Se crea una muestra bootstrapping
+  set.seed(seeds[i])
+  indices <- sample(1:nrow(datos_train), size = nrow(datos_train), replace = TRUE)
+  pseudo_muestra <- datos_train[indices, ]
+  
+   # Se calculan los p-values con la nueva muestra
+  resultados_anova[[i]] <- pseudo_muestra %>%
+                           dplyr::select(-type) %>%
+                           map_dbl(.f = custom_anova, y = pseudo_muestra$type)
+}
+
+# Los resultados almacenados en forma de lista se convierten en dataframe
+names(resultados_anova) <-  paste("resample", 1:n_boot, sep = "_") 
+resultados_anova <- data.frame(resultados_anova)
+
+resultados_anova<- cbind(rownames(resultados_anova), data.frame(resultados_anova, row.names = NULL))
+
+names(resultados_anova)[1] = "gen"
+
+resultados_anova <- resultados_anova %>%
+                      mutate(pvalue_medio = rowMeans(resultados_anova[, -1])) %>%
+                      arrange(pvalue_medio)
+head(resultados_anova)
+```
+Los resultados almacenados en forma de lista se convierten en dataframe.
+
+Para agilizar el proceso, es recomendable paralelizar el loop externo.
+
+### VERSIÓN PARALELIZADA DE BOOTSTRAPPING PARA FILTRADO POR ANOVA
+
+```{r, message=FALSE}
+
+library(doParallel)
+# Se especifica el número de cores a utilizar (esto depende del ordenador empleado)
+registerDoParallel(cores = 3)
+getDoParWorkers()
+
+# Número de iteraciones bootstrapping
+n_boot <- 100
+
+# Semillas para que los muestreos sean reproducibles
+set.seed(123)
+seeds = sample.int(1000, size = n_boot)
+
+# Función ANOVA
+custom_anova <- function(x,y){
+  anova <- summary(aov(x ~ as.factor(y)))
+  return(unlist(anova)["Pr(>F)1"])
+}
+
+```
+
+```{r}
+
+### LOOP PARALELIZADO
+library(parallel)
+# La función foreach devuelve los resultados de cada iteración en una lista
+
+resultados_anova_pvalue <- foreach(i = 1:n_boot) %dopar% {
+  
+  require(dplyr)
+  require(purrr)
+  
+  # Se crea una muestra por bootstrapping
+  set.seed(seeds[i])
+  indices <- sample(1:nrow(datos_train), size = nrow(datos_train), replace = TRUE)
+  pseudo_muestra <- datos_train[indices, ]
+  
+  
+  # Se calculan los p-values para la nueva muestra 
+  p_values <- pseudo_muestra %>%
+    select(-type) %>%
+    map_dbl(.f = custom_anova, y = pseudo_muestra$type) 
+  
+
+  # Se devuelven los p-value
+  p_values
+}
+
+options(cores = 1)
+
+```
+```{r, message=FALSE}
+
+require(dplyr)
+require(tidyverse)
+# Los resultados almacenados en forma de lista se convierten en dataframe
+names(resultados_anova_pvalue) <-  paste("resample", 1:n_boot, sep = "_") 
+
+resultados_anova_pvalue <- data.frame(resultados_anova_pvalue)
+
+resultados_anova_pvalue <- resultados_anova_pvalue %>% tibble::rownames_to_column(var = "gen")
+
+resultados_anova_pvalue <- resultados_anova_pvalue %>% mutate(pvalue_medio = rowMeans(resultados_anova_pvalue[, -1])) %>%
+  arrange(pvalue_medio)
+
+# Se guarda en disco el objeto creado para no tener que repetir de nuevo toda la computación.
+saveRDS(object = resultados_anova_pvalue, file = "resultados_anova_pvalue.rds")
+
+head(resultados_anova_pvalue)
+```
+Se guarda en disco el objeto creado para no tener que repetir de nuevo toda la computación: "resultados_anova_pvalue.rds"
+
+```{r}
+resultados_anova_pvalue %>% dplyr::select(1,2,3,4) %>% head()
+```
+
+## Anotación de los genes.
+
+```{r}
+ann<- select(illuminaHumanv3.db, keys = resultados_anova_pvalue$gen, columns=c("ENTREZID","SYMBOL","GENENAME"))
+
+```
+```{r}
+ann[1:25,]
+
+```
+
+```{r, echo=TRUE}
+# Se filtran los 100, 50 y 25 genes identificados como más relevantes mediante anova
+filtrado_anova_pvalue_100 <- resultados_anova_pvalue %>% pull(gen) %>% head(100)
+filtrado_anova_pvalue_50  <- resultados_anova_pvalue %>% pull(gen) %>% head(50)
+filtrado_anova_pvalue_25 <-  resultados_anova_pvalue %>% pull(gen) %>% head(25)
+```
+
+### 5.2. Signal to noise (S2N)
+
+
+
+S2N=\(\frac{μ_{grupo i} − μ_{resto de grupos}}{σ_{grupo i} + σ_{resto de grupos}}\)
+
+
+```{r, warning=FALSE, message=FALSE}
+# Se identifica el nombre de los distintos grupos (tipos de tumor)
+grupos <- unique(datos_train$type)
+
+# Se crea una lista donde almacenar los resultados para cada grupo
+s2n_por_grupo <- vector(mode = "list", length = length(grupos))
+names(s2n_por_grupo) <- grupos
+
+# Se calcula el valor S2N de cada gen en cada grupo
+for (grupo in grupos){
+  
+  # Media y desviación de cada gen en el grupo i
+  datos_grupo <- datos_train %>% filter(type == grupo) %>% dplyr::select(-type)
+  medias_grupo <- map_dbl(datos_grupo, .f = mean)
+  sd_grupo <- map_dbl(datos_grupo, .f = sd)
+  
+  # Media y desviación de cada gen en el resto de grupos
+  datos_otros <- datos_train %>% filter(type != grupo) %>% dplyr::select(-type)
+  medias_otros <- map_dbl(datos_otros, .f = mean)
+  sd_otros <- map_dbl(datos_otros, .f = sd)
+  
+  # Calculo S2N
+  s2n <- (medias_grupo - medias_otros)/(sd_grupo + sd_otros)
+  s2n_por_grupo[[grupo]] <- s2n
+}
+```
+
+
+
+```{r}
+extraer_top_genes <- function(x, n=10, abs=TRUE){
+  if (abs == TRUE) {
+  x <- abs(x) 
+  x <- sort(x)
+  x <- x[1:n]
+  return(names(x))    
+  }else{
+  x <- sort(x)
+  x <- x[1:n]
+  return(names(x))    
+  }
+}
+
+s2n_por_grupo <- s2n_por_grupo %>% map(.f = extraer_top_genes)
+```
+
+
+
+```{r}
+genes_seleccionados_s2n <- unique(unlist(s2n_por_grupo))
+length(genes_seleccionados_s2n)
+```
+```{r}
+annotation<- select(illuminaHumanv3.db, keys = genes_seleccionados_s2n, columns=c("ENTREZID","SYMBOL","GENENAME"))
+```
+```{r}
+annotation[1:25,]
+```
+
+Al igual, que en el filtrado por ANOVA, para evitar que la selección este excesivamente influenciada por la muestra de entrenamiento, es conveniente recurrir a un proceso de resampling y agregar los resultados. Esta vez, como método de agregación se emplea la media.
+
+### VERSIÓN PARALELIZADA DE BOOTSTRAPPING PARA FILTRADO POR SIGNAL TO NOISE
+
+```{r}
+# Warning: Este cálculo puede tardar varias horas.
+
+library(doParallel)
+# Se especifica el número de cores a utilizar (esto depende del ordenador)
+registerDoParallel(cores = 3)
+
+# Número de iteraciones bootstrapping
+n_boot <- 100
+
+# Semillas para que los muestreos sean reproducibles
+set.seed(123)
+seeds = sample.int(1000, size = n_boot)
+
+# LOOP PARALELIZADO
+
+resultados_s2n <- foreach(i = 1:n_boot) %dopar% {
+  require(purrr)
+  require(dplyr)
+  
+  # Se crea una nueva muestra por bootstrapping
+  set.seed(seeds[i])
+  indices <- sample(1:nrow(datos_train),
+                    size = nrow(datos_train),
+                    replace = TRUE)
+  pseudo_muestra <- datos_train[indices, ]
+  
+  # Se identifica el nombre de los distintos grupos (tipos de tumor)
+  grupos <- unique(pseudo_muestra$type)
+
+  # Se crea una lista donde almacenar los resultados para cada grupo
+  s2n_por_grupo <- vector(mode = "list", length = length(grupos))
+  names(s2n_por_grupo) <- grupos 
+  
+  # Se calcula el valor S2N de cada gen en cada grupo
+  for (grupo in grupos){
+    # Media y desviación de cada gen en el grupo i
+    datos_grupo  <- pseudo_muestra %>% filter(type == grupo) %>% select(-type)
+    medias_grupo <- map_dbl(datos_grupo, .f = mean)
+    sd_grupo     <- map_dbl(datos_grupo, .f = sd)
+    
+    # Media y desviación de cada gen en el resto de grupos
+    datos_otros  <- pseudo_muestra %>% filter(type != grupo) %>% select(-type)
+    medias_otros <- map_dbl(datos_otros, .f = mean)
+    sd_otros     <- map_dbl(datos_otros, .f = sd)
+    
+    # Calculo S2N
+    s2n <- (medias_grupo - medias_otros)/(sd_grupo + sd_otros)
+    s2n_por_grupo[[grupo]] <- s2n
+  }
+  
+  s2n_por_grupo
+ 
+}
+options(cores = 1)
+
+names(resultados_s2n) <- paste("resample", 1:n_boot, sep = "_")
+
+# Se guarda en disco el objeto creado
+saveRDS(object = resultados_s2n, file = "resultados_s2n.rds")
+```
+
+En cada elemento de la lista resultados_s2n se ha almacenado el resultado de una repetición bootstrapping, que a su vez, es otra lista con los valores S2N de cada gen en cada grupo. Para obtener un único listado final por tipo, se tienen que agregar los valores obtenidos en las diferentes repeticiones.
+
+```{r, message=FALSE, warning=FALSE}
+require(tidyverse)
+require(dplyr)
+resultados_s2n_grouped <- resultados_s2n %>%
+  unlist() %>%
+  as.data.frame() %>%
+  tibble:: rownames_to_column(var = "id") %>%
+  separate(col = id, sep = "[.]",
+           remove = TRUE,
+           into = c("resample", "type", "gen")) %>%
+  dplyr::rename(s2n =".") %>%
+  group_by(type) %>%
+  nest()
+```
+
+
+```{r}
+# Para cada tipo  se calcula el s2n medio de los genes y se devuelven los 10 genes con mayor S2N absoluto
+
+extraer_top_genes <- function(df, n=10){
+  df <- df %>% spread(key = "resample", value = s2n)
+  df <- df %>% mutate(s2n_medio = abs(rowMeans(df[, -1])))
+  top_genes <- df %>% arrange(desc(s2n_medio)) %>% pull(gen) %>% head(n)
+  return(as.character(top_genes))
+}
+
+resultados_s2n_grouped <- resultados_s2n_grouped %>%
+  mutate(gen = map(.x = data, .f = extraer_top_genes))
+
+resultados_s2n_grouped %>% 
+  head()
+
+saveRDS(object = resultados_s2n_grouped, file = "resultados_s2n_grouped.rds")
+```
+Para cada tipo  se calcula el s2n medio de los genes y se devuelven los 10 genes con mayor S2N absoluto: "resultados_s2n_grouped.rds"
+
+se identifica la intersección entre los genes seleccionados para cada tipo , y se eliminan aquellos que son comunes para varios estadíos (aparecen más de dos veces): "filtrado_s2n_60.rds"
+
+```{r}
+genes_repetidos <-  resultados_s2n_grouped %>%
+                    pull(gen) %>%
+                    unlist() %>%
+                    table() %>%
+                    as.data.frame() %>%
+                    filter(Freq > 1) %>%
+                    pull(".") %>% 
+                    as.character()
+
+
+filtrado_s2n_60 <- resultados_s2n_grouped %>%
+                    pull(gen) %>%
+                    unlist()
+filtrado_s2n_60 <- filtrado_s2n_60[!(filtrado_s2n_60 %in% genes_repetidos)]
+saveRDS(object = filtrado_s2n_60, file = "filtrado_s2n_60.rds")
+```
+
+El mismo proceso se repite pero seleccionando únicamente los top 5 genes por grupo:"filtrado_s2n_30.rds"   
+
+```{r}
+
+extraer_top_genes <- function(df, n=5){
+  df <- df %>% spread(key = "resample", value = s2n)
+  df <- df %>% mutate(s2n_medio = abs(rowMeans(df[, -1])))
+  top_genes <- df %>% arrange(desc(s2n_medio)) %>% pull(gen) %>% head(n)
+  return(as.character(top_genes))
+}
+
+resultados_s2n_grouped <- resultados_s2n_grouped %>%
+  mutate(gen = map(.x = data, .f = extraer_top_genes))
+
+resultados_s2n_grouped %>% 
+  head()
+
+saveRDS(object = resultados_s2n_grouped, file = "resultados_s2n_grouped.rds")
+```
+
+
+```{r}
+genes_repetidos <-  resultados_s2n_grouped %>%
+                    pull(gen) %>%
+                    unlist() %>%
+                    table() %>%
+                    as.data.frame() %>%
+                    filter(Freq > 1) %>%
+                    pull(".") %>% 
+                    as.character()
+
+
+filtrado_s2n_30 <- resultados_s2n_grouped %>%
+                    pull(gen) %>%
+                    unlist()
+filtrado_s2n_30 <- filtrado_s2n_30[!(filtrado_s2n_30 %in% genes_repetidos)]
+saveRDS(object = filtrado_s2n_30, file = "filtrado_s2n_30.rds")
+```
+
+### 5.3. Comparación de filtrados
+
+Se estudia cuantos genes en común se han seleccionado con cada uno de los métodos.
+
+```{r, echo=TRUE}
+length(intersect(filtrado_anova_pvalue_100, filtrado_s2n_60))
+```
+```{r, echo=TRUE}
+length(intersect(filtrado_anova_pvalue_50, filtrado_s2n_30))
+```
+La selección de genes resultante con ambos métodos es muy distinta.
+
+
+### 5.4. Reducción de dimensionalidad
+
+
+Se aplica un PCA a los niveles de expresión y se conservan las componentes principales hasta alcanzar un 95% de varianza explicada.
+
+```{r}
+transformacion_pca <- preProcess(x = datos_train, method = "pca", thresh = 0.95)
+transformacion_pca
+```
+```{r}
+datos_train_pca    <- predict(object = transformacion_pca, newdata = datos_train)
+datos_test_pca     <- predict(object = transformacion_pca, newdata = datos_test)
+```
+
+
+## 6. Modelos:
+
+- SVM
+- RandomForest
+- Neural Network
+
+
+### 6.1. SVM:  Máquinas de Vector Soporte (Support Vector Machines, SVMs)
+
+
+El método svmRadial de caret emplea la función ksvm() del paquete kernlab. Este algoritmo tiene 2 hiperparámetros:
+
+- sigma: coeficiente del kernel radial.
+
+- C: penalización por violaciones del margen del hiperplano.
+
+### 6.1.1. Filtrado por ANOVA p-value 100
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+library(doParallel)
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(sigma = c(0.0001, 0.001, 0.01),
+                               C = c(1, 10, 50, 100, 250, 500, 700, 1000))
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+# AJUSTE DEL MODELO
+set.seed(342)
+svmrad_pvalue_100 <- train(
+                      form = type ~ .,
+                      data = datos_train[c("type", filtrado_anova_pvalue_100)],
+                      method = "svmRadial",
+                      tuneGrid = hiperparametros,
+                      metric = "Accuracy",
+                      trControl = control_train
+                    )
+registerDoParallel(cores = 1)
+saveRDS(object = svmrad_pvalue_100, file = "svmrad_pvalue_100.rds")
+```
+
+```{r}
+svmrad_pvalue_100
+```
+
+```{r}
+ggplot(svmrad_pvalue_100, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo SVM Radial") +
+  theme_bw()
+```
+
+
+
+### 6.1.2. Filtrado por ANOVA p-value 50
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(sigma = c(0.0001, 0.001, 0.01),
+                               C = c(1, 10, 50, 100, 500, 700, 1000, 1500))
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+svmrad_pvalue_50 <- train(
+                      form = type ~ .,
+                      data = datos_train[c("type", filtrado_anova_pvalue_50)],
+                      method = "svmRadial",
+                      tuneGrid = hiperparametros,
+                      metric = "Accuracy",
+                      trControl = control_train
+                    )
+registerDoParallel(cores = 1)
+saveRDS(object = svmrad_pvalue_50, file = "svmrad_pvalue_50.rds")
+```
+
+```{r}
+svmrad_pvalue_50
+```
+```{r}
+ggplot(svmrad_pvalue_50, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo SVM Radial") +
+  theme_bw()
+```
+
+### 6.1.3. Filtrado por ANOVA p-value 25
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(sigma = c(0.0001, 0.001, 0.01),
+                               C = c(1, 10, 50, 100, 500, 700, 1000, 1500))
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+
+set.seed(342)
+svmrad_pvalue_25 <- train(
+                      form = type ~ .,
+                      data = datos_train[c("type", filtrado_anova_pvalue_25)],
+                      method = "svmRadial",
+                      tuneGrid = hiperparametros,
+                      metric = "Accuracy",
+                      trControl = control_train
+                    )
+registerDoParallel(cores = 1)
+saveRDS(object = svmrad_pvalue_25, file = "svmrad_pvalue_25.rds")
+```
+
+```{r}
+svmrad_pvalue_25
+```
+```{r}
+ggplot(svmrad_pvalue_25, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo SVM Radial") +
+  theme_bw()
+```
+
+### 6.1.4. Filtrado por S2N 60
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(sigma = c(0.0001, 0.001, 0.01),
+                               C = c(10, 50, 100, 200, 600, 800, 1000, 1500))
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+                                
+# AJUSTE DEL MODELO
+
+set.seed(342)
+svmrad_s2n_60  <- train(
+                      form = type ~ .,
+                      data = datos_train[c("type", filtrado_s2n_60)],
+                      method = "svmRadial",
+                      tuneGrid = hiperparametros,
+                      metric = "Accuracy",
+                      trControl = control_train
+                      )
+registerDoParallel(cores = 1)
+saveRDS(object = svmrad_s2n_60, file = "svmrad_s2n_60.rds")
+
+```
+
+```{r}
+svmrad_s2n_60
+```
+
+```{r}
+ggplot(svmrad_s2n_60, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo SVM Radial") +
+  theme_bw()
+```
+
+### 6.1.5. Filtrado por S2N 30
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(sigma = c(0.0001, 0.001, 0.01),
+                               C = c(10, 50, 100, 200, 600, 800, 1000, 1500))
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+                                
+# AJUSTE DEL MODELO
+
+set.seed(342)
+svmrad_s2n_30 <- train(
+                      form = type ~ .,
+                      data = datos_train[c("type", filtrado_s2n_30)],
+                      method = "svmRadial",
+                      tuneGrid = hiperparametros,
+                      metric = "Accuracy",
+                      trControl = control_train
+                      )
+registerDoParallel(cores = 1)
+saveRDS(object = svmrad_s2n_30, file = "svmrad_s2n_30.rds")
+```
+
+```{r}
+svmrad_s2n_30
+```
+
+
+```{r}
+ggplot(svmrad_s2n_30, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo SVM Radial") +
+  theme_bw()
+```
+
+
+### 6.1.6. Reducción PCA
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(sigma = c(0.001, 0.01, 0.1),
+                               C = c(1, 20, 50, 100, 200, 500, 1000, 1500, 2000))
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+                                
+# AJUSTE DEL MODELO
+set.seed(342)
+svmrad_pca <- train(form = type ~ .,
+                      data = datos_train_pca,
+                      method = "svmRadial",
+                      tuneGrid = hiperparametros,
+                      metric = "Accuracy",
+                      trControl = control_train)
+registerDoParallel(cores = 1)
+saveRDS(object = svmrad_pca, file = "svmrad_pca.rds")
+```
+
+
+```{r}
+svmrad_pca
+```
+
+
+```{r}
+ggplot(svmrad_pca, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo SVM Radial") +
+  theme_bw()
+```
+
+###  6.2. Random Forest
+
+El método ranger de caret emplea la función ranger() del paquete ranger. Este algoritmo tiene 3 hiperparámetros:
+
+- mtry: número predictores seleccionados aleatoriamente en cada árbol.
+
+- min.node.size: tamaño mínimo que tiene que tener un nodo para poder ser dividido.
+
+- splitrule: criterio de división.
+
+
+
+### 6.2.1. Filtrado por ANOVA p-value 100
+
+```{r}
+library(ranger)
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(mtry = c(2, 5, 10, 50),
+                               min.node.size = c(2, 3, 4, 5, 10),
+                               splitrule = "gini")
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+rf_pvalue_100 <- train(
+                  form = type ~ .,
+                  data = datos_train[c("type", filtrado_anova_pvalue_100)],
+                  method = "ranger",
+                  tuneGrid = hiperparametros,
+                  metric = "Accuracy",
+                  trControl = control_train,
+                  # Número de árboles ajustados
+                  num.trees = 500)
+
+saveRDS(object = rf_pvalue_100, file = "rf_pvalue_100.rds")
+registerDoParallel(cores = 1)
+```
+
+```{r}
+rf_pvalue_100
+```
+
+```{r}
+ggplot(rf_pvalue_100, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo Random Forest") +
+  guides(color = guide_legend(title = "mtry"),
+         shape = guide_legend(title = "mtry")) +
+  theme_bw()
+```
+
+### 6.2.2. Filtrado por ANOVA p-value 50
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(mtry = c(2, 3, 5, 10, 25),
+                               min.node.size = c(2, 3, 4, 5, 10),
+                               splitrule = "gini")
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+rf_pvalue_50 <- train(
+                  form = type ~ .,
+                  data = datos_train[c("type", filtrado_anova_pvalue_50)],
+                  method = "ranger",
+                  tuneGrid = hiperparametros,
+                  metric = "Accuracy",
+                  trControl = control_train,
+                  # Número de árboles ajustados
+                  num.trees = 500)
+
+saveRDS(object = rf_pvalue_50, file = "rf_pvalue_50.rds")
+registerDoParallel(cores = 1)
+rf_pvalue_50
+```
+
+
+```{r}
+ggplot(rf_pvalue_50, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo Random Forest") +
+  guides(color = guide_legend(title = "mtry"),
+         shape = guide_legend(title = "mtry")) +
+  theme_bw()
+```
+
+### 6.2.3. Filtrado por ANOVA p-value 25
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(mtry = c(2, 3, 5, 10, 25),
+                               min.node.size = c(2, 3, 4, 5, 10),
+                               splitrule = "gini")
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+rf_pvalue_25 <- train(
+                  form = type ~ .,
+                  data = datos_train[c("type", filtrado_anova_pvalue_25)],
+                  method = "ranger",
+                  tuneGrid = hiperparametros,
+                  metric = "Accuracy",
+                  trControl = control_train,
+                  # Número de árboles ajustados
+                  num.trees = 500)
+
+saveRDS(object = rf_pvalue_25, file = "rf_pvalue_25.rds")
+registerDoParallel(cores = 1)
+rf_pvalue_25
+```
+
+
+```{r}
+ggplot(rf_pvalue_25, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo Random Forest") +
+  guides(color = guide_legend(title = "mtry"),
+         shape = guide_legend(title = "mtry")) +
+  theme_bw()
+```
+
+### 6.2.4. Filtrado por S2N 60
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(mtry = c(5, 7, 10, 15, 17),
+                               min.node.size = c(2, 3, 5, 10, 15, 20),
+                               splitrule = "gini")
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+rf_s2n_60 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_s2n_60)],
+                method = "ranger",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Número de árboles ajustados
+                num.trees = 500
+              )
+
+saveRDS(object = rf_s2n_60, file = "rf_s2n_60.rds")
+registerDoParallel(cores = 1)
+rf_s2n_60
+```
+
+
+```{r}
+ggplot(rf_s2n_60, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo Random Forest") +
+  guides(color = guide_legend(title = "mtry"),
+         shape = guide_legend(title = "mtry")) +
+  theme_bw()
+```
+
+
+
+### 6.2.5. Filtrado por S2N 30
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(mtry = c(1,3,5, 7, 10),
+                               min.node.size = c(2, 3, 5, 10, 15, 20),
+                               splitrule = "gini")
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+rf_s2n_30 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_s2n_30)],
+                method = "ranger",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Número de árboles ajustados
+                num.trees = 500
+              )
+
+saveRDS(object = rf_s2n_30, file = "rf_s2n_30.rds")
+registerDoParallel(cores = 1)
+rf_s2n_30 
+```
+
+
+```{r}
+ggplot(rf_s2n_30, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo Random Forest") +
+  guides(color = guide_legend(title = "mtry"),
+         shape = guide_legend(title = "mtry")) +
+  theme_bw()
+```
+
+
+### 6.2.6. Reducción PCA
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(mtry = c(5, 10, 25, 30),
+                               min.node.size = c(2, 3, 4, 5, 10),
+                               splitrule = "gini")
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+rf_pca <- train(
+            form   = type ~ .,
+            data   = datos_train_pca,
+            method = "ranger",
+            tuneGrid = hiperparametros,
+            metric = "Accuracy",
+            trControl = control_train,
+            # Número de árboles ajustados
+            num.trees = 500)
+
+saveRDS(object = rf_pca, file = "rf_pca.rds")
+registerDoParallel(cores = 1)
+rf_pca
+```
+
+
+
+```{r}
+ggplot(rf_pca, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo Random Forest") +
+  guides(color = guide_legend(title = "mtry"),
+         shape = guide_legend(title = "mtry")) +
+  theme_bw()
+```
+
+
+
+### 6.3. Neural Network
+
+El método nnet de caret emplea la función nnet() del paquete nnet para crear redes neuronales con una capa oculta. Este algoritmo tiene 2 hiperparámetros:
+
+- size: número de neuronas en la capa oculta.
+
+- decay: controla la regularización durante el entrenamiento de la red.
+
+En vista de los resultados obtenidos con los algoritmos anteriores, no se empleará el filtrado por reducción PCA.
+
+
+
+### 6.3.1. Filtrado por S2N 60
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(size = c(5, 10, 15, 20, 40),
+                               decay = c(0.01, 0.1))
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+nnet_s2n_60 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_s2n_60)],
+                method = "nnet",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Rango de inicialización de los pesos
+                rang = c(-0.7, 0.7),
+                # Número máximo de pesos
+                MaxNWts = 10000,
+                # Para que no se muestre cada iteración por pantalla
+                trace = FALSE
+              )
+
+saveRDS(object = nnet_s2n_60, file = "nnet_s2n_60.rds")
+registerDoParallel(cores = 1)
+nnet_s2n_60
+```
+
+
+```{r}
+ggplot(nnet_s2n_60, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo NNET") +
+  theme_bw()
+```
+
+
+### 6.3.2. Filtrado por S2N 30
+
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(size = c(5, 10, 20, 30, 45),
+                               decay = c(0.01, 0.1))
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+nnet_s2n_30 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_s2n_30)],
+                method = "nnet",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Rango de inicialización de los pesos
+                rang = c(-0.7, 0.7),
+                # Número máximo de pesos
+                MaxNWts = 10000,
+                # Para que no se muestre cada iteración por pantalla
+                trace = FALSE
+              )
+
+saveRDS(object = nnet_s2n_30, file = "nnet_s2n_30.rds")
+registerDoParallel(cores = 1)
+nnet_s2n_30
+```
+
+
+
+```{r}
+ggplot(nnet_s2n_30, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo NNET") +
+  theme_bw()
+```
+
+
+### 6.3.3. Filtrado por ANOVA p-value 100
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(size = c(5, 10, 20, 30, 45),
+                               decay = c(0.01, 0.1))
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+nnet_pvalue_100 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_anova_pvalue_100)],
+                method = "nnet",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Rango de inicialización de los pesos
+                rang = c(-0.7, 0.7),
+                # Número máximo de pesos
+                MaxNWts = 10000,
+                # Para que no se muestre cada iteración por pantalla
+                trace = FALSE
+              )
+
+saveRDS(object = nnet_pvalue_100, file = "nnet_pvalue_100.rds")
+registerDoParallel(cores = 1)
+nnet_pvalue_100
+```
+
+```{r}
+ggplot(nnet_pvalue_100, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo NNET") +
+  theme_bw()
+```
+
+### 6.3.4. Filtrado por ANOVA p-value 50
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(size = c(5, 10, 20, 30, 45),
+                               decay = c(0.01, 0.1))
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+nnet_pvalue_50 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_anova_pvalue_50)],
+                method = "nnet",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Rango de inicialización de los pesos
+                rang = c(-0.7, 0.7),
+                # Número máximo de pesos
+                MaxNWts = 10000,
+                # Para que no se muestre cada iteración por pantalla
+                trace = FALSE
+              )
+
+saveRDS(object = nnet_pvalue_50, file = "nnet_pvalue_50.rds")
+registerDoParallel(cores = 1)
+nnet_pvalue_50
+```
+
+
+```{r}
+ggplot(nnet_pvalue_50, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo NNET") +
+  theme_bw()
+```
+
+
+
+### 6.3.5. Filtrado por ANOVA p-value 25
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(size = c(5, 10, 20, 30, 45),
+                               decay = c(0.01, 0.1))
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+nnet_pvalue_25 <- train(
+                form = type ~ .,
+                data = datos_train[c("type", filtrado_anova_pvalue_25)],
+                method = "nnet",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Rango de inicialización de los pesos
+                rang = c(-0.7, 0.7),
+                # Número máximo de pesos
+                MaxNWts = 10000,
+                # Para que no se muestre cada iteración por pantalla
+                trace = FALSE
+              )
+
+saveRDS(object = nnet_pvalue_25, file = "nnet_pvalue_25.rds")
+registerDoParallel(cores = 1)
+nnet_pvalue_25
+```
+
+
+```{r}
+ggplot(nnet_pvalue_25, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo NNET") +
+  theme_bw()
+```
+
+### 6.3.6. PCA
+
+```{r}
+# PARALELIZACIÓN DE PROCESO
+registerDoParallel(cores = 3)
+
+# HIPERPARÁMETROS, NÚMERO DE REPETICIONES Y SEMILLAS PARA CADA REPETICIÓN
+repeticiones_boot <- 50
+
+# Hiperparámetros
+hiperparametros <- expand.grid(size = c(5, 10, 20, 30, 45),
+                               decay = c(0.01, 0.1))
+
+set.seed(123)
+seeds <- vector(mode = "list", length = repeticiones_boot + 1)
+for (i in 1:repeticiones_boot) {
+  seeds[[i]] <- sample.int(1000, nrow(hiperparametros))
+}
+seeds[[repeticiones_boot + 1]] <- sample.int(1000, 1)
+
+# DEFINICIÓN DEL ENTRENAMIENTO
+control_train <- trainControl(method = "boot", number = repeticiones_boot,
+                              seeds = seeds, returnResamp = "final",
+                              verboseIter = FALSE, allowParallel = TRUE)
+
+# AJUSTE DEL MODELO
+set.seed(342)
+nnet_pca <- train(
+                form = type ~ .,
+                data = datos_train_pca,
+                method = "nnet",
+                tuneGrid = hiperparametros,
+                metric = "Accuracy",
+                trControl = control_train,
+                # Rango de inicialización de los pesos
+                rang = c(-0.7, 0.7),
+                # Número máximo de pesos
+                MaxNWts = 10000,
+                # Para que no se muestre cada iteración por pantalla
+                trace = FALSE
+              )
+
+saveRDS(object = nnet_pca, file = "nnet_pca.rds")
+registerDoParallel(cores = 1)
+nnet_pca
+```
+
+
+```{r}
+ggplot(nnet_pca, highlight = TRUE) +
+  labs(title = "Evolución del accuracy del modelo NNET") +
+  theme_bw()
+```
+
+### 6.4. Comparación de modelos
+
+
+### 6.4.1. Error de validación
+
+```{r}
+modelos <- list(
+  SVMrad_pvalue_100 = svmrad_pvalue_100,
+  SVMrad_pvalue_50  = svmrad_pvalue_50,
+  SVMrad_pvalue_25  = svmrad_pvalue_25,
+  SVMrad_s2n_60     = svmrad_s2n_60,
+  SVMrad_s2n_30     = svmrad_s2n_30,
+  SVMrad_pca        = svmrad_pca,
+  RF_pvalue_100     = rf_pvalue_100,
+  RF_pvalue_50      = rf_pvalue_50,
+  RF_pvalue_25      = rf_pvalue_25,
+  RF_s2n_60         = rf_s2n_60,
+  RF_s2n_30         = rf_s2n_30,
+  RF_pca            = rf_pca,
+  NNET_pvalue_100   = nnet_pvalue_100,
+  NNET_pvalue_50    = nnet_pvalue_50,
+  NNET_pvalue_25    = nnet_pvalue_25,
+  NNET_s2n_60       = nnet_s2n_60,
+  NNET_s2n_30       = nnet_s2n_30
+  )
+
+resultados_resamples <- resamples(modelos)
+
+# Se trasforma el dataframe devuelto por resamples() para separar el nombre del modelo y las métricas en columnas distintas.
+metricas_resamples <- resultados_resamples$values %>%
+                         gather(key = "modelo", value = "valor", -Resample) %>%
+                         separate(col = "modelo", into = c("modelo", "metrica"),
+                                  sep = "~", remove = TRUE)
+# Accuracy y Kappa promedio de cada modelo
+promedio_metricas_resamples <- metricas_resamples %>% 
+  group_by(modelo, metrica) %>% 
+  summarise(media = mean(valor)) %>%
+  spread(key = metrica, value = media) %>%
+  arrange(desc(Accuracy))
+
+promedio_metricas_resamples
+```
+
+
+```{r}
+metricas_resamples %>%
+  filter(metrica == "Accuracy") %>%
+  group_by(modelo) %>% 
+  summarise(media = mean(valor)) %>%
+  ggplot(aes(x = reorder(modelo, media), y = media, label = round(media, 2))) +
+    geom_segment(aes(x = reorder(modelo, media), y = 0,
+                     xend = modelo, yend = media),
+                     color = "grey50") +
+    geom_point(size = 8, color = "firebrick") +
+    geom_text(color = "white", size = 3) +
+    scale_y_continuous(limits = c(0, 1)) +
+    # Accuracy basal
+    geom_hline(yintercept = 0.156, linetype = "dashed") +
+    annotate(geom = "text", y = 0.28, x = 12.5, label = "Accuracy basal") +
+    labs(title = "Validación: Accuracy medio repeated-CV",
+         subtitle = "Modelos ordenados por media",
+         x = "modelo") +
+    coord_flip() +
+    theme_bw()
+```
+
+
+
+```{r}
+metricas_resamples %>% filter(metrica == "Accuracy") %>%
+  group_by(modelo) %>% 
+  mutate(media = mean(valor)) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(modelo, media), y = valor, color = modelo)) +
+    geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 0.6) +
+    scale_y_continuous(limits = c(0, 1)) +
+    # Accuracy basal
+    geom_hline(yintercept = 0.156, linetype = "dashed") +
+    annotate(geom = "text", y = 0.25, x = 12, label = "Accuracy basal") +
+    theme_bw() +
+    labs(title = "Validación: Accuracy medio repeated-CV",
+         subtitle = "Modelos ordenados por media") +
+    coord_flip() +
+    theme(legend.position = "none")
+```
+
+
+
+```{r, message=FALSE}
+library(qqplotr)
+metricas_resamples %>%
+  filter(modelo %in% c("NNET_pvalue_100", "NNET_pvalue_50", "SVMrad_pvalue_100") &
+         metrica == "Accuracy") %>%
+  ggplot(aes(sample = valor, color = modelo)) +
+    stat_qq_band(alpha = 0.5, color = "gray") +
+    stat_qq_line() +
+    stat_qq_point() +
+    theme_bw() +
+  theme(legend.position = "none") +
+    facet_wrap(~modelo)
+```
+El análisis gráfico no muestra grandes desviaciones de la normal, además, dado que se dispone de más de 30 valores por grupo, el t-test tiene cierta robustez. Se procede a comparar los modelos.
+
+```{r}
+metricas_ttest <- metricas_resamples %>%
+  dplyr::filter(modelo %in% c("SVMrad_pvalue_100","NNET_pvalue_50", "NNET_pvalue_100") &
+                  metrica == "Accuracy") %>%
+  dplyr::select(-metrica)
+
+pairwise.t.test(x = metricas_ttest$valor,
+                g = metricas_ttest$modelo,
+                paired = TRUE,
+                # Al ser solo 2 comparaciones, no se añade ajuste de p.value
+                p.adjust.method = "none")
+```
+ 
+
+
+### 6.4.2. Error de test
+
+```{r}
+predic_svmrad_pvalue_100 <- predict(object = svmrad_pvalue_100, newdata = datos_test)
+predic_svmrad_pvalue_50  <- predict(object = svmrad_pvalue_50, newdata = datos_test)
+predic_svmrad_pvalue_25  <- predict(object = svmrad_pvalue_25, newdata = datos_test)
+predic_svmrad_s2n_60    <- predict(object = svmrad_s2n_60, newdata = datos_test)
+predic_svmrad_s2n_30     <- predict(object = svmrad_s2n_30, newdata = datos_test)
+predic_svmrad_pca        <- predict(object = svmrad_pca, newdata = datos_test_pca)
+predic_rf_pvalue_100     <- predict(object = rf_pvalue_100, newdata = datos_test)
+predic_rf_pvalue_50      <- predict(object = rf_pvalue_50, newdata = datos_test)
+predic_rf_pvalue_25      <- predict(object = rf_pvalue_25, newdata = datos_test)
+predic_rf_s2n_60        <- predict(object = rf_s2n_60, newdata = datos_test)
+predic_rf_s2n_30         <- predict(object = rf_s2n_30, newdata = datos_test)
+predic_rf_pca            <- predict(object = rf_pca, newdata = datos_test_pca)
+predic_nnet_s2n_60      <- predict(object = nnet_s2n_60, newdata = datos_test)
+predic_nnet_s2n_30       <- predict(object = nnet_s2n_30, newdata = datos_test)
+predic_nnet_pvalue_100   <- predict(object = nnet_pvalue_100, newdata = datos_test)
+predic_nnet_pvalue_50   <- predict(object = nnet_pvalue_50, newdata = datos_test)
+predic_nnet_pvalue_25   <- predict(object = nnet_pvalue_25, newdata = datos_test)
+
+predicciones <- data.frame(
+      SVMrad_pvalue_100 =predic_svmrad_pvalue_100,
+      SVMrad_pvalue_50  = predic_svmrad_pvalue_50,
+      SVMrad_pvalue_25  = predic_svmrad_pvalue_25,
+      SVMrad_s2n_60     = predic_svmrad_s2n_60,
+      SVMrad_s2n_30     = predic_svmrad_s2n_30,
+      SVMrad_pca        = predic_svmrad_pca,
+      RF_pvalue_100     = predic_rf_pvalue_100,
+      RF_pvalue_50      = predic_rf_pvalue_50,
+      RF_pvalue_25      = predic_rf_pvalue_25,
+      RF_s2n_60         = predic_rf_s2n_60,
+      RF_s2n_30         = predic_rf_s2n_30,
+      RF_pca            = predic_rf_pca,
+      NNET_s2n_60       = predic_nnet_s2n_60,
+      NNET_s2n_30       = predic_nnet_s2n_30,
+      NNET_pvalue_100   = predic_nnet_pvalue_100,
+      NNET_pvalue_50    = predic_nnet_pvalue_50,
+      NNET_pvalue_25    = predic_nnet_pvalue_25,
+      valor_real        = datos_test$type
+    )
+
+predicciones %>% head()
+```
+
+
+
+```{r, message=FALSE}
+calculo_accuracy <- function(x, y){
+  return(mean(x == y))
+}
+
+accuracy_test <- map_dbl(.x = predicciones[, -17],
+                         .f = calculo_accuracy,
+                         y = predicciones[, 17]) %>%
+                 as.data.frame() %>%
+                 dplyr::rename(accuracy_test = ".") %>%
+                 tibble::rownames_to_column(var = "modelo") %>%
+                 arrange(desc(accuracy_test))
+
+metricas_resamples %>% 
+  dplyr::group_by(modelo, metrica) %>% 
+  summarise(media = mean(valor)) %>%
+  spread(key = metrica, value = media) %>%
+  dplyr::select(accuracy_validacion = Accuracy) %>%
+  left_join(accuracy_test, by = "modelo") %>% 
+  arrange(desc(accuracy_test))
+```
+
+```{r, message=FALSE, warning=FALSE}
+metricas_resamples %>% 
+  dplyr::group_by(modelo, metrica) %>% 
+  summarise(media = mean(valor)) %>%
+  spread(key = metrica, value = media) %>%
+  dplyr::select(accuracy_validacion = Accuracy) %>%
+  left_join(accuracy_test, by = "modelo") %>%
+  gather(key = "datos", value = "accuracy", -modelo) %>%
+  ggplot(aes(x = reorder(modelo, accuracy), y = accuracy,
+           color = datos, label = round(accuracy, 2))) +
+  geom_point(size = 9) +
+  ylim(0, 1) +
+  scale_color_manual(values = c("orangered2", "gray50")) +
+  geom_text(color = "white", size = 2.5) +
+  # Accuracy basal
+  geom_hline(yintercept = 0.156, linetype = "dashed") +
+  annotate(geom = "text", y = 0.25, x = 12, label = "Accuracy basal") +
+  coord_flip() +
+  labs(title = "Accuracy promedio de validación y test", 
+       x = "modelo") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+```
+
+
+```{r}
+predicciones %>% dplyr::select(SVMrad_pvalue_25, valor_real) %>% dplyr::filter(SVMrad_pvalue_25 != valor_real)
+```
+```{r}
+predicciones %>% dplyr::select(NNET_pvalue_50, valor_real) %>% dplyr::filter(NNET_pvalue_50 != valor_real)
+```
+
+```{r}
+predicciones %>% dplyr::select(RF_pvalue_50, valor_real) %>% dplyr::filter(RF_pvalue_50 != valor_real)
+```
+
+```{r}
+confusionMatrix(data = predicciones$SVMrad_pvalue_25, reference = as.factor(datos_test$type))
+```
+La matriz de confusión muestra que el modelo clasifica peor unos tipos que otros.
+
+```{r}
+confusionMatrix(data = predicciones$NNET_pvalue_50, reference = as.factor(datos_test$type))
+```
+```{r}
+confusionMatrix(data = predicciones$RF_pvalue_50, reference = as.factor(datos_test$type))
+```
+
+### 6.4.3. Mejor modelo
+
+
+## 7. Model ensemble (stacking)
+
+
+
+
+```{r}
+moda <- function(x, indice_mejor_modelo){
+  tabla_freq <- table(x)
+  freq_maxima <- max(tabla_freq)
+  if(sum(tabla_freq == freq_maxima) > 1) {
+    # En caso de empate, se devuelve la predicción que ocupa el índice del mejor modelo
+    return(x[indice_mejor_modelo])
+  }
+  return(names(which.max(table(x))))
+}
+
+predicciones_ensemble <- predicciones %>%
+  dplyr::select(SVMrad_pvalue_100, NNET_pvalue_100, NNET_pvalue_50, RF_pvalue_50, RF_pvalue_25) %>%
+  mutate(moda = apply(X = dplyr::select(.data = predicciones,SVMrad_pvalue_100, NNET_pvalue_100, NNET_pvalue_50, RF_pvalue_50, RF_pvalue_25),
+                      MARGIN = 1, 
+                      FUN = moda,
+                      indice_mejor_modelo = 1))
+
+predicciones_ensemble %>% head()
+```
+
+```{r}
+mean(predicciones_ensemble$moda == datos_test$type)
+```
+
+## 8. Clustering
+
+
+```{r}
+library(factoextra)
+
+# Se unen de nuevo todos los datos en un único dataframe
+datos_clustering <- bind_rows(datos_train, datos_test)
+datos_clustering <- datos_clustering %>% arrange(type)
+
+# La librería factoextra emplea el nombre de las filas del dataframe para identificar cada observación.
+datos_clustering <- datos_clustering %>% as.data.frame()
+rownames(datos_clustering) <- paste(1:nrow(datos_clustering),                                  datos_clustering$type, sep = "_")
+
+# Se emplean únicamente los genes filtrados
+datos_clustering <- datos_clustering %>% dplyr::select(type, filtrado_anova_pvalue_100)
+
+# Se calculan las distancias en base a la correlación de Pearson
+mat_distancias <- get_dist(datos_clustering[, -1],
+                           method = "pearson",
+                           stand = FALSE)
+library(cluster)
+
+# HIERARCHICAL CLUSTERING
+
+set.seed(101)
+hc_average <- hclust(d = mat_distancias, method = "complete")
+
+# VISUALIZACIÓN DEL DENDOGRAMA
+
+# Vector de colores para cada observacion: Se juntan dos paletas para tener
+# suficientes colores
+library(RColorBrewer)
+colores <- c(brewer.pal(n = 8, name = "Dark2"),
+             brewer.pal(n = 8, name = "Set1")) %>%
+          unique()
+# Se seleccionan 6 colores, uno para cada tipo
+colores <- colores[1:6]
+
+# Se asigna a cada tipo de tumor uno de los colores. Para conseguirlo de forma
+# rápida, se convierte la variable tipo_tumor en factor y se emplea su codificación
+# numérica interna para asignar los colores.
+colores <- colores[as.factor(datos_clustering$type)]
+
+# Se reorganiza el vector de colores según el orden en que se han agrupado las
+# observaciones en el clustering
+colores <- colores[hc_average$order]
+
+fviz_dend(x = hc_average, 
+          label_cols = colores,
+          cex = 0.2,
+          lwd = 0.1,
+          main = "Linkage completo",
+          type = "circular")
+```
+
+## Actualización del cronograma.
+
+La nueva planificación queda así:
+
+```{r, echo=F}
+library(kableExtra)
+text_tbl <- data.frame(
+  Tarea = c("PEC0. PROPUESTA TFM"  , "PEC1. PLAN DE TRABAJO"  ,"Estudio y selección de datos que contengan muestras de diferentes fases de EM", "Selección de algoritmos clasificadores y paquetes en R", "Reestructuración de los datos", "Entreno y evaluación clasificadores", "ENTREGA PEC2", "Selección y reestructuración de nuevos datos", "División y preprocesado", "Filtrado de genes", "Aplicación de los algoritmos y comparación de modelos",
+"ENTREGA PEC3", "Cambio de clases", "Filtrado de genes, entreno y evaluación", "Conclusiones", "Redacción dela Memoria","ENTREGA PEC4" ,"PEC5a. Elaboración de la presentación","PEC5b. Defensa pública"),
+  Inicio = c("2021-02-17",      "2021-03-02","2021-03-17","2021-03-17",     "2021-04-10","2021-04-15","2021-04-19", "2021-04-20","2021-05-03","2021-05-07",
+"2021-05-09","2021-05-17","2021-05-18",
+"2021-05-22","2021-06-05","2021-06-01",  "2021-06-08","2021-06-9","2021-06-16"),
+  Fin = c("2021-03-01",
+"2021-03-16","2021-04-10","2021-04-10",
+"2021-04-15","2021-04-19","2021-04-19",
+"2021-05-02","2021-05-06","2021-05-09", "2021-05-17","2021-05-17","2021-05-21", "2021-06-05","2021-06-08","2021-06-08",
+"2021-06-08","2021-06-13","2021-06-23"),
+  Dificultad =
+  c("7","7","6","5","6","8","NA","9","6","8","8", "NA","5","6","8","7","NA","NA", "NA"))
+
+
+kbl(text_tbl) %>%
+  kable_styling(full_width = F) %>%
+  column_spec(1,width = "20em", border_right = T, border_left = T) %>%
+  column_spec(2, width = "10em",border_right= T ) %>%
+  column_spec(3, width = "10em",border_right= T ) %>%
+  column_spec(4, width = "10em",border_right = T)
+
+```
+```{r, echo=FALSE}
+
+tasks <- c("PEC0. PROPUESTA TFM"  , "PEC1. PLAN DE TRABAJO"  ,"Estudio y selección de datos que contengan muestras de diferentes fases de EM", "Selección de algoritmos clasificadores y paquetes en R", "Reestructuración de los datos", "Entreno y evaluación clasificadores", "ENTREGA PEC2", "Selección y reestructuración de nuevos datos", "División y preprocesado", "Filtrado de genes", "Aplicación de los algoritmos y comparación de modelos",
+"ENTREGA PEC3", "Cambio de clases", "Filtrado de genes, entreno y evaluación", "Conclusiones", "Redacción dela Memoria","ENTREGA PEC4" ,"PEC5a. Elaboración de la presentación","PEC5b. Defensa pública")
+dfr <- data.frame(
+  name        = factor(tasks, levels = tasks),
+  start.date  = as.Date(c("2021-02-17",      "2021-03-02","2021-03-17","2021-03-17",     "2021-04-10","2021-04-15","2021-04-19", "2021-04-20","2021-05-03","2021-05-07",
+"2021-05-09","2021-05-17","2021-05-18",
+"2021-05-22","2021-06-05","2021-06-01",  "2021-06-08","2021-06-9","2021-06-16")),
+  end.date    = as.Date(c("2021-03-01",
+"2021-03-16","2021-04-10","2021-04-10",
+"2021-04-15","2021-04-19","2021-04-19",
+"2021-05-02","2021-05-06","2021-05-09", "2021-05-17","2021-05-17","2021-05-21", "2021-06-05","2021-06-08","2021-06-08",
+"2021-06-08","2021-06-13","2021-06-23")),
+  Realizado = c(TRUE, TRUE, TRUE,TRUE, TRUE,TRUE, TRUE, TRUE,TRUE, TRUE,TRUE, TRUE, TRUE,TRUE, TRUE,TRUE, TRUE, FALSE, FALSE)
+)
+
+ggplot(dfr, aes(x =start.date, xend= end.date, y=name, yend = name, color=Realizado)) +
+  geom_segment(size = 6) +
+  xlab(NULL) + ylab(NULL)
+```
+
+
+
+
+
+
